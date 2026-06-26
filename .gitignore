@@ -1,0 +1,69 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# SSL Certificates — never commit private keys
+cert.pem
+key.pem
+*.pem
+*.key
+*.crt
+*.csr
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Logs
+*.log
+setup.log
+app.log
+nohup.out
+
+# Generated files
+templates.py
+
+# Backups
+*.orig
+*.bak
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# PID files
+*.pid
+app.pid
+
+# Cache
+*.cache
+.pytest_cache/
