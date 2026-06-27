@@ -58,6 +58,11 @@ A loyalty and analytics platform built on **Elasticsearch** as the primary intel
 <img width="2358" height="1524" alt="image" src="https://github.com/user-attachments/assets/5644002b-957d-40be-af4a-bdd9aea56a1c" />
 
 
+## Check Out Flow
+
+<img width="1784" height="1778" alt="beeloyalty-customer-update-flow" src="https://github.com/user-attachments/assets/b8298157-80a7-42d6-b1ec-169c1fbeba21" />
+
+
 ## Elasticsearch indices
 
 | Index | Primary key | Key fields | Notable mapping |
