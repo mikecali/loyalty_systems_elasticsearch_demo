@@ -53,6 +53,11 @@ A loyalty and analytics platform built on **Elasticsearch** as the primary intel
 
 ---
 
+## Data Flow
+
+<img width="2358" height="1524" alt="image" src="https://github.com/user-attachments/assets/5644002b-957d-40be-af4a-bdd9aea56a1c" />
+
+
 ## Elasticsearch indices
 
 | Index | Primary key | Key fields | Notable mapping |
