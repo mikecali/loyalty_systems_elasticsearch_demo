@@ -1,637 +1,796 @@
 """
-Optimized Jollibee BeeLoyalty System - Core Business Logic Service
-Performance optimized version with bulk operations and efficient data handling
+Modernized Jollibee BeeLoyalty Service
+All Claude AI calls go through es_client.claude_complete() which hits:
+  POST /_inference/completion/.anthropic-claude-4.5-haiku-completion
+Elastic manages the Anthropic credential — zero API keys in Python.
 """
 
 import uuid
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+
+import requests as http_requests
+
 from elasticsearch_client import ElasticsearchClient
 from config import Config
 
 logger = logging.getLogger(__name__)
 
+
+# ── Weather helper (Open-Meteo, free, no key) ──────────────────────────────
+
+def _fetch_weather(lat: float, lon: float) -> Dict:
+    """
+    Fetch live weather from Open-Meteo (free, no key).
+    Falls back to Manila defaults if the server has no outbound internet.
+    """
+    try:
+        url  = (f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat}&longitude={lon}&current_weather=true&timezone=auto")
+        resp = http_requests.get(url, timeout=8)
+        if resp.status_code == 200:
+            cw = resp.json().get("current_weather", {})
+            return {"temperature_c": cw.get("temperature", 30),
+                    "condition":     _wmo_to_label(cw.get("weathercode", 0)),
+                    "weathercode":   cw.get("weathercode", 0),
+                    "source":        "live"}
+        logger.warning(f"Open-Meteo non-200: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Open-Meteo unreachable: {e} — using defaults")
+    # Default: hot and sunny (typical Metro Manila)
+    return {"temperature_c": 30, "condition": "sunny",
+            "weathercode": 0, "source": "default"}
+
+
+
+
+def _wmo_to_label(code: int) -> str:
+    if code == 0:               return "sunny"
+    if code in range(1, 4):    return "partly cloudy"
+    if code in range(45, 68):  return "rainy"
+    if code in range(71, 78):  return "cold"
+    if code in range(80, 100): return "stormy"
+    return "cloudy"
+
+
+# ── Preference signal builder ───────────────────────────────────────────────
+
+def _weather_to_default_query(condition: str, temp: float) -> str:
+    """Rule-based fallback query when Claude is unavailable."""
+    if temp >= 32 or condition == "sunny":
+        return "cold drinks iced refreshing milkshake sundae"
+    if condition in ("rainy", "stormy"):
+        return "hot soup hearty family meal comfort food"
+    if condition == "cold":
+        return "hot chocolate warm meal chicken soup"
+    return "bestseller popular chicken joy burger"
+
+
+def _build_preference_signal(history: List[Dict]) -> Dict:
+    """
+    Build a weighted preference signal from order history.
+
+    Key principles:
+      1. RECENCY — orders in the last 7 days get 3×, last 30 days 2×, older 1×
+      2. CATEGORY over item name — "Burgers" beats "Double Cheesy Yumburger"
+         for the search query so ES can find related items, not just exact repeats
+      3. DEDUPLICATION — each unique category/item contributes once to the
+         query regardless of how many times it's named
+      4. TREND DETECTION — if the most recent 3 orders are all one category,
+         that category is boosted as the primary signal
+
+    Returns:
+      {
+        "search_query": str,          # clean query for ES hybrid search
+        "primary_category": str,      # dominant recent category
+        "trending_toward": str|None,  # category shift detected
+        "top_categories": [...],      # ranked [(cat, weighted_score), ...]
+        "top_items": [...]            # ranked [(item_name, weighted_score), ...]
+      }
+    """
+    now = datetime.now()
+
+    cat_scores:  Dict[str, float] = {}
+    item_scores: Dict[str, float] = {}
+
+    for order in history:
+        # Recency multiplier
+        try:
+            ts  = datetime.fromisoformat(order.get("timestamp", ""))
+            age = (now - ts).days
+        except Exception:
+            age = 999
+        weight = 3.0 if age <= 7 else (2.0 if age <= 30 else 1.0)
+
+        for item in order.get("items", []):
+            name = item.get("name", "").strip()
+            cat  = item.get("category", "").strip()
+            qty  = item.get("quantity", 1)
+
+            if cat:
+                cat_scores[cat]   = cat_scores.get(cat, 0) + (weight * qty)
+            if name:
+                item_scores[name] = item_scores.get(name, 0) + (weight * qty)
+
+    top_cats  = sorted(cat_scores.items(),  key=lambda x: x[1], reverse=True)
+    top_items = sorted(item_scores.items(), key=lambda x: x[1], reverse=True)
+
+    # Trend detection: what category do the 3 most recent orders belong to?
+    recent_cats = []
+    for order in history[:3]:
+        for item in order.get("items", []):
+            c = item.get("category", "")
+            if c and c not in recent_cats:
+                recent_cats.append(c)
+
+    trending_toward = recent_cats[0] if recent_cats else None
+    primary_cat     = top_cats[0][0] if top_cats else None
+
+    # Build the search query:
+    #   - Lead with trending category (recency signal)
+    #   - Then top 2 weighted categories (breadth signal)
+    #   - Then top 2 weighted item names (specificity signal)
+    #   - Deduplicated, max ~8 tokens so ES isn't confused by a wall of text
+    query_parts = []
+    if trending_toward:
+        query_parts.append(trending_toward)
+    for cat, _ in top_cats[:2]:
+        if cat not in query_parts:
+            query_parts.append(cat)
+    for name, _ in top_items[:2]:
+        # Use only the first 3 words of item names to keep the query clean
+        short = " ".join(name.split()[:3])
+        if short not in query_parts:
+            query_parts.append(short)
+
+    search_query = " ".join(query_parts)
+
+    logger.info(
+        f"Preference signal → query='{search_query}' | "
+        f"primary_cat='{primary_cat}' | trending='{trending_toward}'"
+    )
+
+    return {
+        "search_query":    search_query,
+        "primary_category": primary_cat,
+        "trending_toward": trending_toward,
+        "top_categories":  top_cats[:5],
+        "top_items":       top_items[:5]
+    }
+
+
+# ── Main service ────────────────────────────────────────────────────────────
+
 class JollibeeService:
-    """Optimized core business logic service for Jollibee BeeLoyalty system"""
-    
+    """
+    Business logic layer.
+    Claude calls: self.es_client.claude_complete(prompt)
+    ES inference endpoint: .anthropic-claude-4.5-haiku-completion
+    """
+
     def __init__(self):
-        """Initialize service with Elasticsearch client"""
         self.es_client = ElasticsearchClient()
-        logger.info("Initialized Jollibee Service")
-    
-    # Customer Management (unchanged - these are already optimized)
+        logger.info("JollibeeService initialized — Claude via ES inference "
+                    f"({Config.CLAUDE_INFERENCE_ID})")
+
+    # ── Customer ───────────────────────────────────────────────────────────────
+
     def get_customer(self, customer_id: str) -> Optional[Dict]:
-        """Get customer profile by ID"""
-        customer = self.es_client.get_document(Config.INDEX_CUSTOMERS, customer_id)
-        if customer:
-            logger.info(f"Retrieved customer: {customer['personal_info']['name']}")
-        return customer
-    
-    def get_customer_recommendations(self, customer_id: str, limit: int = 8) -> List[Dict]:
-        """Get personalized menu recommendations for customer"""
-        customer = self.get_customer(customer_id)
-        if not customer:
-            return []
-        
-        # Build semantic query from customer preferences
-        favorite_items = customer.get('preferences', {}).get('favorite_items', [])
-        search_text = " ".join(favorite_items)
-        
-        if not search_text.strip():
-            search_text = "popular bestseller recommended"
-        
-        # Perform semantic search
-        results = self.es_client.semantic_search(
-            Config.INDEX_MENU,
-            search_text,
-            size=limit,
-            source_fields=["name", "category", "price", "description", "points_value", "is_new", "is_bestseller"]
+        c = self.es_client.get_document(Config.INDEX_CUSTOMERS, customer_id)
+        if c:
+            logger.info(f"Retrieved customer: {c['personal_info']['name']}")
+        return c
+
+    # ── Loyalty ────────────────────────────────────────────────────────────────
+
+    def calculate_points(self, total: float, channel: str, tier: str) -> int:
+        base = int(total / 100) * (15 if channel in ["app", "delivery"] else 10)
+        return int(base * {"BeeBuddy": 1.0, "BeeFan": 1.2, "BeeElite": 1.5}.get(tier, 1.0))
+
+    def check_tier_upgrade(self, annual: float) -> str:
+        if annual >= 5000: return "BeeElite"
+        if annual >= 2000: return "BeeFan"
+        return "BeeBuddy"
+
+    # ── ① Hybrid Search ────────────────────────────────────────────────────────
+
+    def search_menu(self, query_text: str, limit: int = 10,
+                    lat: Optional[float] = None, lon: Optional[float] = None,
+                    category: Optional[str] = None) -> List[Dict]:
+        geo = {"lat": lat, "lon": lon, "distance_km": 10.0} if lat is not None else None
+        results = self.es_client.hybrid_search(
+            Config.INDEX_MENU, query_text, size=limit,
+            source_fields=["name", "category", "price", "description",
+                           "points_value", "is_new", "is_bestseller"],
+            geo_filter=geo, category_filter=category
         )
-        
-        recommendations = []
-        for hit in results.get('hits', {}).get('hits', []):
-            item = hit['_source']
-            recommendations.append({
-                "name": item['name'],
-                "category": item['category'],
-                "price": item['price'],
-                "description": item['description'],
-                "points_value": item['points_value'],
-                "is_new": item.get('is_new', False),
-                "is_bestseller": item.get('is_bestseller', False),
-                "relevance_score": hit['_score']
+        items = []
+        for hit in results.get("hits", {}).get("hits", []):
+            s = hit["_source"]
+            items.append({
+                "name": s["name"], "category": s["category"],
+                "price": s["price"], "description": s["description"],
+                "points_value": s.get("points_value", 0),
+                "is_new": s.get("is_new", False),
+                "is_bestseller": s.get("is_bestseller", False),
+                "relevance_score": hit.get("_score") or hit.get("_rank")
             })
-        
-        logger.info(f"Generated {len(recommendations)} recommendations for {customer['personal_info']['name']}")
-        return recommendations
-    
-    def redeem_points(self, customer_id: str, points_to_redeem: int, item_name: str) -> Tuple[bool, str, Dict]:
-        """Redeem customer points for rewards"""
+        logger.info(f"Hybrid search '{query_text}' → {len(items)} results")
+        return items
+
+    # ── ② AI Recs: Order History ───────────────────────────────────────────────
+
+    def get_history_based_recommendations(self, customer_id: str, limit: int = 6,
+                                          lat: Optional[float] = None,
+                                          lon: Optional[float] = None) -> Dict:
+        """
+        Recommendation logic:
+          ES:     retrieves order history (newest first), builds recency-weighted
+                  preference signal, runs hybrid search on category-led query.
+          Claude: one-sentence insight explaining the recommendation angle
+                  (references the trend if one is detected).
+
+        The preference signal prioritises:
+          - What the customer ordered RECENTLY (last 7 days: 3× weight)
+          - Category-level signal so ES finds related items, not just repeats
+          - Detected category shift (e.g. chicken → burgers) surfaces as the
+            primary search driver
+        """
+        customer = self.get_customer(customer_id)
+        if not customer:
+            return {"recommendations": [], "insight": "Customer not found"}
+
+        history = self.es_client.get_customer_order_history(customer_id, limit=30)
+        if not history:
+            return self._fallback_popular_recommendations(lat, lon, limit)
+
+        signal = _build_preference_signal(history)
+
+        # Optional: if a strong trend is detected toward a specific category,
+        # lock the ES category filter for precision
+        cat_filter = None
+        if (signal["trending_toward"]
+                and signal["trending_toward"] != signal["primary_category"]):
+            # Customer is shifting — follow the trend
+            cat_filter = signal["trending_toward"]
+            logger.info(f"Trend shift detected → filtering by '{cat_filter}'")
+
+        menu_results = self.search_menu(
+            signal["search_query"], limit=limit, lat=lat, lon=lon,
+            category=cat_filter
+        )
+
+        # If category filter returned too few results, fall back to unfiltered
+        if len(menu_results) < 3 and cat_filter:
+            logger.info("Category filter too narrow — retrying without filter")
+            menu_results = self.search_menu(
+                signal["search_query"], limit=limit, lat=lat, lon=lon
+            )
+
+        # Claude via ES inference — give it the signal context, not raw item names
+        top_cats_str  = ", ".join(c for c, _ in signal["top_categories"][:3])
+        top_items_str = ", ".join(n for n, _ in signal["top_items"][:3])
+        trend_note    = (
+            f"Recently shifting toward: {signal['trending_toward']}."
+            if signal["trending_toward"] and
+               signal["trending_toward"] != signal["primary_category"]
+            else ""
+        )
+
+        prompt = (
+            "You are a Jollibee loyalty app assistant. "
+            "Write ONE sentence (max 25 words) explaining why these recommendations suit this customer. "
+            "Reference their recent trend if present. Be warm and specific. No preamble.\n\n"
+            f"Customer: {customer['personal_info']['name']} | "
+            f"Tier: {customer['loyalty_profile']['tier']} | "
+            f"Favourite categories: {top_cats_str} | "
+            f"Recent items: {top_items_str} | "
+            f"{trend_note}"
+        )
+        insight = (
+            self.es_client.claude_complete(prompt)
+            or f"Picked for your love of {signal['primary_category'] or 'Jollibee classics'}!"
+        )
+
+        return {
+            "customer_name":    customer["personal_info"]["name"],
+            "tier":             customer["loyalty_profile"]["tier"],
+            "recommendations":  menu_results,
+            "insight":          insight,
+            "based_on":         f"{len(history)} past orders",
+            "top_ordered":      [n for n, _ in signal["top_items"][:5]],
+            "preference_signal": {
+                "query_used":       signal["search_query"],
+                "primary_category": signal["primary_category"],
+                "trending_toward":  signal["trending_toward"]
+            }
+        }
+
+    # ── ③ AI Recs: Weather ─────────────────────────────────────────────────────
+
+    def get_weather_based_recommendations(self, customer_id: str,
+                                          lat: float, lon: float,
+                                          limit: int = 6) -> Dict:
+        """
+        Open-Meteo: live weather at lat/lon (falls back to Manila defaults).
+        Claude (ES inference): maps weather -> {"query": ..., "reason": ...}.
+          - Strips markdown fences if Claude ignores the no-markdown instruction
+          - Falls back gracefully if JSON parse fails
+        ES: hybrid search on weather-derived query + geo nearest store.
+        """
+        customer  = self.get_customer(customer_id)
+        cust_name = customer["personal_info"]["name"] if customer else "there"
+        weather   = _fetch_weather(lat, lon)
+
+        temp      = weather["temperature_c"]
+        condition = weather["condition"]
+        source    = weather.get("source", "live")
+        logger.info(f"Weather for ({lat},{lon}): {temp}°C, {condition} [{source}]")
+
+        # Defaults — used if Claude call fails or returns unparseable output
+        query  = _weather_to_default_query(condition, temp)
+        reason = f"Great picks for {condition} weather at {temp}°C!"
+
+        prompt = (
+            "You are a food recommendation engine for Jollibee Philippines. "
+            "Respond with ONLY a raw JSON object — no markdown, no code fences, "
+            "no explanation before or after. Two keys only:\n"
+            '  "query": string — 4-7 words describing the ideal menu items for this weather\n'
+            '  "reason": string — one sentence, max 18 words, why these suit the weather\n'
+            f"Weather: {temp}°C, {condition}"
+        )
+
+        raw = self.es_client.claude_complete(prompt)
+        logger.info(f"Claude weather raw response: {raw!r}")
+
+        if raw:
+            # Strip markdown fences (Claude sometimes wraps JSON despite instructions)
+            cleaned = raw.strip()
+            if "```" in cleaned:
+                cleaned = "\n".join(
+                    l for l in cleaned.split("\n")
+                    if not l.strip().startswith("```")
+                ).strip()
+
+            try:
+                parsed = json.loads(cleaned)
+                query  = parsed.get("query", query).strip()
+                reason = parsed.get("reason", reason).strip()
+                logger.info(f"Weather query from Claude: {query!r}")
+            except json.JSONDecodeError:
+                # Claude returned prose — extract the first sentence as query
+                logger.warning(f"Claude weather JSON parse failed, using line extraction")
+                lines = [l.strip() for l in raw.split("\n") if l.strip()]
+                if lines:
+                    query = lines[0][:80]
+
+        menu_results = self.search_menu(query, limit=limit, lat=lat, lon=lon)
+        nearby       = self.es_client.find_nearby_stores(lat, lon, distance_km=5.0, size=1)
+
+        return {
+            "customer_name":     cust_name,
+            "weather":           {"temperature_c": temp, "condition": condition,
+                                  "source": source},
+            "search_query_used": query,
+            "reason":            reason,
+            "recommendations":   menu_results,
+            "nearest_store":     nearby[0] if nearby else None,
+            "location":          {"lat": lat, "lon": lon}
+        }
+
+    # ── ④ Upsize Suggestions ───────────────────────────────────────────────────
+
+    def get_upsize_suggestions(self, customer_id: str,
+                               current_cart: List[Dict],
+                               lat: Optional[float] = None,
+                               lon: Optional[float] = None) -> Dict:
+        """
+        Context-aware upsize suggestions combining TWO signals:
+
+        Signal 1 — ORDER HISTORY (ES):
+          Recency-weighted preference signal (_build_preference_signal).
+          Surfaces trending category and avg order value for spend-gap message.
+
+        Signal 2 — WEATHER (Open-Meteo + Claude via ES inference):
+          Fetches live weather at the store lat/lon.
+          Maps weather → food mood query (e.g. 32°C sunny → iced drinks).
+
+        Both signals combine into a single hybrid search query for candidates.
+        Claude writes pitches that reference weather AND the customer's taste.
+
+        Returns UI context flags: weather_used, weather_condition, weather_temp,
+        history_used, top_category, insight.
+        """
+        customer = self.get_customer(customer_id)
+        if not customer:
+            return {"suggestions": [], "message": ""}
+
+        cart_total = sum(i.get("price", 0) * i.get("quantity", 1) for i in current_cart)
+        cart_names = [i["name"] for i in current_cart]
+        tier       = customer["loyalty_profile"]["tier"]
+
+        # ── Signal 1: Order history ───────────────────────────────────────────
+        history   = self.es_client.get_customer_order_history(customer_id, limit=30)
+        avg_value = (sum(o.get("order_total", 0) for o in history) / len(history)
+                     if history else 0)
+
+        history_used   = bool(history)
+        top_category   = None
+        history_signal = ""
+        if history:
+            signal         = _build_preference_signal(history)
+            top_category   = signal.get("trending_toward") or signal.get("primary_category")
+            history_signal = top_category or ""
+
+        # ── Signal 2: Weather at store location ───────────────────────────────
+        weather_used      = False
+        weather_condition = None
+        weather_temp      = None
+        weather_signal    = ""
+
+        if lat is not None and lon is not None:
+            weather           = _fetch_weather(lat, lon)
+            weather_condition = weather["condition"]
+            weather_temp      = weather["temperature_c"]
+            weather_used      = True
+            weather_signal    = _weather_to_default_query(weather_condition, weather_temp)
+            logger.info(f"Upsize weather signal: {weather_temp}°C {weather_condition}")
+
+        # ── Combined upgrade search query ─────────────────────────────────────
+        if weather_signal and history_signal:
+            upgrade_query = f"{weather_signal} {history_signal} upgrade value"
+        elif weather_signal:
+            upgrade_query = f"{weather_signal} large family upgrade"
+        elif history_signal:
+            upgrade_query = f"{history_signal} large bucket family upgrade value meal"
+        else:
+            upgrade_query = "large family bucket upsize party tray value meal"
+
+        logger.info(f"Upsize search query: '{upgrade_query}'")
+
+        candidates = [
+            m for m in self.search_menu(upgrade_query, limit=10, lat=lat, lon=lon)
+            if m["name"] not in cart_names
+        ][:4]
+
+        if not candidates:
+            return {
+                "suggestions": [], "message": "You've already got the best value combo!",
+                "weather_used": weather_used, "history_used": history_used
+            }
+
+        # ── Spend-gap message ─────────────────────────────────────────────────
+        gap = avg_value - cart_total
+        opportunity = (
+            f"Your average order is ₱{avg_value:.0f} — "
+            f"you're ₱{gap:.0f} below your usual spend"
+            if gap > 50 else "Add a perfect match to complete your order"
+        )
+
+        # ── Claude: contextual pitch per candidate ────────────────────────────
+        weather_ctx = (f"Current weather at store: {weather_temp}°C, {weather_condition}."
+                       if weather_used else "")
+        history_ctx = (f"Customer's favourite category: {top_category}."
+                       if top_category else "")
+
+        prompt = (
+            "You are a Jollibee upsell assistant. "
+            "Write short, warm, non-pushy upgrade suggestions.\n\n"
+            f"Cart: {', '.join(cart_names)}\n"
+            f"Upgrade candidates: {', '.join(c['name'] for c in candidates)}\n"
+            f"Customer tier: {tier}\n"
+            f"{weather_ctx}\n"
+            f"{history_ctx}\n"
+            f"Spend context: {opportunity}\n\n"
+            "Output ONLY a JSON array. Each element: "
+            '{"item": "<exact candidate name>", '
+            '"pitch": "<one warm sentence max 15 words referencing weather or their taste>"}. '
+            "No markdown, no extra text."
+        )
+        raw = self.es_client.claude_complete(prompt)
+        pitches: Dict[str, str] = {}
+        if raw:
+            cleaned = raw.strip()
+            if "```" in cleaned:
+                cleaned = "\n".join(
+                    l for l in cleaned.split("\n")
+                    if not l.strip().startswith("```")
+                ).strip()
+            try:
+                for item in json.loads(cleaned):
+                    pitches[item["item"]] = item["pitch"]
+            except Exception:
+                pass
+
+        suggestions = [
+            {**c, "pitch": pitches.get(
+                c["name"],
+                f"Perfect for {weather_condition} weather!" if weather_used
+                else f"Upgrade to {c['name']} for the whole family!"
+            )}
+            for c in candidates
+        ]
+
+        # Short insight line (separate Claude call — fast with Haiku)
+        insight = ""
+        if weather_used or history_used:
+            insight_prompt = (
+                "Write ONE short sentence (max 15 words) explaining why these upgrades "
+                "suit this customer right now. Warm, specific, no preamble.\n"
+                f"{weather_ctx} {history_ctx}"
+            )
+            insight = self.es_client.claude_complete(insight_prompt) or ""
+
+        return {
+            "customer_name":        customer["personal_info"]["name"],
+            "current_cart_total":   cart_total,
+            "historical_avg_order": round(avg_value, 2),
+            "opportunity":          opportunity,
+            "suggestions":          suggestions,
+            "insight":              insight,
+            "weather_used":         weather_used,
+            "weather_condition":    weather_condition,
+            "weather_temp":         weather_temp,
+            "history_used":         history_used,
+            "top_category":         top_category,
+        }
+
+    # ── Fallback ───────────────────────────────────────────────────────────────
+
+    def _fallback_popular_recommendations(self, lat, lon, limit) -> Dict:
+        if lat and lon:
+            popular = self.es_client.get_popular_items_near_location(lat, lon, top_n=limit)
+            query   = " ".join(p["name"] for p in popular[:5]) or "bestseller popular"
+        else:
+            query = "bestseller popular"
+        return {"recommendations": self.search_menu(query, limit=limit, lat=lat, lon=lon),
+                "insight": "Popular choices near you!"}
+
+    # ── Transactions ───────────────────────────────────────────────────────────
+
+    def create_transaction(self, customer_id: str, items: List[Dict], channel: str,
+                           store_info: Dict, payment_method: str = "cash") -> Tuple[bool, str, Dict]:
         customer = self.get_customer(customer_id)
         if not customer:
             return False, "Customer not found", {}
-        
-        current_points = customer['loyalty_profile']['total_points']
-        
-        if current_points < points_to_redeem:
-            return False, f"Insufficient points. Current: {current_points}, Required: {points_to_redeem}", {}
-        
-        # Update customer points
-        new_points = current_points - points_to_redeem
-        customer['loyalty_profile']['total_points'] = new_points
-        customer['loyalty_profile']['points_redeemed_ytd'] += points_to_redeem
-        customer['loyalty_profile']['last_activity'] = datetime.now().isoformat()
-        
-        # Remove ML field to prevent duplicate token errors
-        if 'ml' in customer:
-            del customer['ml']
-        
-        success = self.es_client.update_document(Config.INDEX_CUSTOMERS, customer_id, customer)
-        
-        if success:
-            logger.info(f"Successfully redeemed {points_to_redeem} points for {customer['personal_info']['name']}")
-            return True, f"Successfully redeemed {points_to_redeem} points for {item_name}", {"new_balance": new_points}
-        else:
-            return False, "Failed to update customer points", {}
-    
-    # Points and Tier Calculation (unchanged)
-    def calculate_points(self, order_total: float, channel: str, customer_tier: str) -> int:
-        """Calculate points earned for an order"""
-        base_points = 0
-        
-        if channel == "dine-in":
-            base_points = int(order_total / 100) * 10
-        elif channel in ["app", "delivery"]:
-            base_points = int(order_total / 100) * 15
-        
-        multipliers = {"BeeBuddy": 1.0, "BeeFan": 1.2, "BeeElite": 1.5}
-        return int(base_points * multipliers.get(customer_tier, 1.0))
-    
-    def check_tier_upgrade(self, annual_spending: float) -> str:
-        """Check if customer qualifies for tier upgrade"""
-        if annual_spending >= 5000:
-            return "BeeElite"
-        elif annual_spending >= 2000:
-            return "BeeFan"
-        else:
-            return "BeeBuddy"
-    
-    # OPTIMIZED: Single Transaction Creation
-    def create_transaction(self, customer_id: str, items: List[Dict], channel: str, 
-                          store_info: Dict, payment_method: str = "cash") -> Tuple[bool, str, Dict]:
-        """Create new transaction and update customer data - OPTIMIZED VERSION"""
-        customer = self.get_customer(customer_id)
-        if not customer:
-            return False, "Customer not found", {}
-        
-        # Calculate order details
-        order_total = sum(item['price'] * item['quantity'] for item in items)
-        customer_tier = customer['loyalty_profile']['tier']
-        points_earned = self.calculate_points(order_total, channel, customer_tier)
-        
-        # Create transaction record
+
+        order_total    = sum(i["price"] * i["quantity"] for i in items)
+        tier           = customer["loyalty_profile"]["tier"]
+        points_earned  = self.calculate_points(order_total, channel, tier)
         transaction_id = f"txn_{customer_id}_{str(uuid.uuid4())[:8]}"
-        transaction_data = {
-            "transaction_id": transaction_id,
-            "customer_id": customer_id,
-            "store_id": store_info.get('store_id', 'store_001'),
+
+        txn = {
+            "transaction_id": transaction_id, "customer_id": customer_id,
+            "store_id":  store_info.get("store_id", "store_001"),
             "timestamp": datetime.now().isoformat(),
-            "channel": channel,
-            "location": store_info,
-            "items": items,
-            "order_total": order_total,
-            "points_earned": points_earned,
-            "points_redeemed": 0,
-            "payment_method": payment_method,
-            "order_type": channel,
+            "channel":   channel, "location": store_info,
+            "items":     items,   "order_total": order_total,
+            "points_earned": points_earned, "points_redeemed": 0,
+            "payment_method": payment_method, "order_type": channel,
             "hour_of_day": datetime.now().hour,
             "day_of_week": datetime.now().strftime("%A"),
-            "is_weekend": datetime.now().weekday() >= 5
+            "is_weekend":  datetime.now().weekday() >= 5
         }
-        
-        # Update customer data
-        current_annual = customer['loyalty_profile']['annual_spending']
-        new_annual = current_annual + order_total
-        new_tier = self.check_tier_upgrade(new_annual)
-        tier_upgraded = new_tier != customer_tier
-        
-        customer['loyalty_profile']['total_points'] += points_earned
-        customer['loyalty_profile']['points_earned_ytd'] += points_earned
-        customer['loyalty_profile']['annual_spending'] = new_annual
-        customer['loyalty_profile']['tier'] = new_tier
-        customer['loyalty_profile']['last_activity'] = datetime.now().isoformat()
-        customer['purchase_behavior']['total_orders'] += 1
-        
-        # Remove ML field to prevent duplicate token errors
-        if 'ml' in customer:
-            del customer['ml']
-        
-        # OPTIMIZATION: Batch all updates together
-        updates_successful = self._batch_transaction_updates(
-            transaction_id, transaction_data,
-            customer_id, customer,
-            store_info.get('store_id', 'store_001'), items
+
+        new_annual    = customer["loyalty_profile"]["annual_spending"] + order_total
+        new_tier      = self.check_tier_upgrade(new_annual)
+        tier_upgraded = new_tier != tier
+
+        customer["loyalty_profile"]["total_points"]      += points_earned
+        customer["loyalty_profile"]["points_earned_ytd"] += points_earned
+        customer["loyalty_profile"]["annual_spending"]    = new_annual
+        customer["loyalty_profile"]["tier"]               = new_tier
+        customer["loyalty_profile"]["last_activity"]      = datetime.now().isoformat()
+        customer["purchase_behavior"]["total_orders"]     += 1
+        customer.pop("ml", None)
+
+        ok = self._batch_transaction_updates(
+            transaction_id, txn, customer_id, customer,
+            store_info.get("store_id", "store_001"), items
         )
-        
-        if not updates_successful:
+        if not ok:
             return False, "Failed to process transaction", {}
-        
-        logger.info(f"Created transaction {transaction_id} for {customer['personal_info']['name']} - ₱{order_total}")
-        
+
         return True, f"Transaction successful! Earned {points_earned} BeePoints.", {
-            "transaction_id": transaction_id,
-            "order_total": order_total,
-            "points_earned": points_earned,
-            "tier_upgraded": tier_upgraded,
-            "new_tier": new_tier if tier_upgraded else customer_tier,
-            "inventory_updated": True
+            "transaction_id": transaction_id, "order_total": order_total,
+            "points_earned":  points_earned,  "tier_upgraded": tier_upgraded,
+            "new_tier": new_tier if tier_upgraded else tier
         }
-    
-    def _batch_transaction_updates(self, transaction_id: str, transaction_data: Dict,
-                                  customer_id: str, customer_data: Dict,
-                                  store_id: str, items: List[Dict]) -> bool:
-        """Batch all transaction-related updates for better performance"""
+
+    def _batch_transaction_updates(self, transaction_id, txn_data,
+                                   customer_id, customer_data,
+                                   store_id, items) -> bool:
         try:
-            # Prepare bulk update data
-            bulk_updates = []
-            
-            # 1. Transaction document
-            bulk_updates.extend([
-                {"index": {"_index": Config.INDEX_TRANSACTIONS, "_id": transaction_id}},
-                transaction_data
-            ])
-            
-            # 2. Customer document
-            bulk_updates.extend([
-                {"index": {"_index": Config.INDEX_CUSTOMERS, "_id": customer_id}},
-                customer_data
-            ])
-            
-            # 3. Inventory updates
-            inventory_updates = self._prepare_inventory_updates(store_id, items)
-            bulk_updates.extend(inventory_updates)
-            
-            # Execute bulk update
-            if bulk_updates:
-                success = self._execute_bulk_update(bulk_updates)
-                if success:
-                    # Only refresh indices once at the end
-                    self.es_client.refresh_index([Config.INDEX_TRANSACTIONS, Config.INDEX_CUSTOMERS, Config.INDEX_INVENTORY])
-                return success
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Batch transaction updates failed: {str(e)}")
-            return False
-    
-    def _prepare_inventory_updates(self, store_id: str, items: List[Dict]) -> List[Dict]:
-        """Prepare inventory updates for bulk operation"""
-        bulk_updates = []
-        
-        try:
-            for item in items:
-                # Find matching inventory item
-                search_query = {
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"store_id": store_id}},
-                                {"match": {"item_name": item["name"]}}
-                            ]
-                        }
-                    },
-                    "size": 1
-                }
-                
-                results = self.es_client.aggregation_search(Config.INDEX_INVENTORY, search_query)
-                
-                if results and results.get('hits', {}).get('hits'):
-                    inventory_hit = results['hits']['hits'][0]
-                    inventory_item = inventory_hit['_source']
-                    inventory_id = inventory_hit['_id']
-                    
-                    # Update inventory data
-                    new_stock = max(0, inventory_item['current_stock'] - item['quantity'])
-                    inventory_item['current_stock'] = new_stock
-                    inventory_item['timestamp'] = datetime.now().isoformat()
-                    
-                    # Update status based on new stock level
-                    reorder_point = inventory_item['reorder_point']
-                    if new_stock <= reorder_point * 0.5:
-                        inventory_item['status'] = "Critical"
-                    elif new_stock <= reorder_point:
-                        inventory_item['status'] = "Low"
-                    elif new_stock <= reorder_point * 2:
-                        inventory_item['status'] = "Adequate"
-                    else:
-                        inventory_item['status'] = "Good"
-                    
-                    # Update predicted stockout
-                    daily_consumption = inventory_item.get('daily_consumption', 10)
-                    if daily_consumption > 0:
-                        days_until_stockout = max(0, (new_stock - reorder_point) / daily_consumption)
-                        predicted_stockout = datetime.now() + timedelta(days=days_until_stockout)
-                        inventory_item['predicted_stockout_date'] = predicted_stockout.isoformat()
-                    
-                    # Add to bulk updates
-                    bulk_updates.extend([
-                        {"index": {"_index": Config.INDEX_INVENTORY, "_id": inventory_id}},
-                        inventory_item
-                    ])
-            
-            return bulk_updates
-            
-        except Exception as e:
-            logger.error(f"Error preparing inventory updates: {str(e)}")
-            return []
-    
-    def _execute_bulk_update(self, bulk_updates: List[Dict]) -> bool:
-        """Execute bulk update using Elasticsearch bulk API"""
-        try:
-            # Convert to newline-delimited JSON format
-            import json
-            bulk_body = "\n".join(json.dumps(item) for item in bulk_updates) + "\n"
-            
-            # Send bulk request
-            import requests
-            response = requests.post(
+            bulk = ([{"index": {"_index": Config.INDEX_TRANSACTIONS, "_id": transaction_id}},
+                     txn_data,
+                     {"index": {"_index": Config.INDEX_CUSTOMERS,    "_id": customer_id}},
+                     customer_data]
+                    + self._prepare_inventory_updates(store_id, items))
+            bulk_body = "\n".join(json.dumps(x) for x in bulk) + "\n"
+            resp = http_requests.post(
                 f"{self.es_client.endpoint}/_bulk",
                 headers={**self.es_client.headers, "Content-Type": "application/x-ndjson"},
-                data=bulk_body,
-                timeout=30
+                data=bulk_body, timeout=30
             )
-            
-            if response.status_code == 200:
-                result = response.json()
-                errors = [item for item in result.get('items', []) if 'error' in item.get('index', {})]
-                
-                if errors:
-                    logger.warning(f"{len(errors)} documents had errors during bulk update")
-                    return len(errors) < len(bulk_updates) * 0.1  # Accept if < 10% errors
-                else:
-                    logger.info(f"Successfully bulk updated {len(bulk_updates)//2} documents")
-                    return True
-            else:
-                logger.error(f"Bulk update failed: {response.status_code}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Bulk update execution failed: {str(e)}")
+            if resp.status_code == 200:
+                self.es_client.refresh_index([Config.INDEX_TRANSACTIONS,
+                                              Config.INDEX_CUSTOMERS,
+                                              Config.INDEX_INVENTORY])
+                return True
+            logger.error(f"Bulk update failed: {resp.status_code}")
             return False
-    
-    # OPTIMIZED: Bulk Transaction Creation
+        except Exception as e:
+            logger.error(f"_batch_transaction_updates error: {e}")
+            return False
+
+    def _prepare_inventory_updates(self, store_id: str, items: List[Dict]) -> List:
+        bulk = []
+        for item in items:
+            q = {"query": {"bool": {"must": [
+                {"term":  {"store_id":  store_id}},
+                {"match": {"item_name": item["name"]}}
+            ]}}, "size": 1}
+            res = self.es_client.aggregation_search(Config.INDEX_INVENTORY, q)
+            if res and res.get("hits", {}).get("hits"):
+                hit  = res["hits"]["hits"][0]
+                inv  = hit["_source"];  inv_id = hit["_id"]
+                inv["current_stock"] = max(0, inv["current_stock"] - item["quantity"])
+                inv["timestamp"]     = datetime.now().isoformat()
+                rp, stock = inv["reorder_point"], inv["current_stock"]
+                inv["status"] = ("Critical" if stock <= rp * 0.5 else
+                                 "Low"      if stock <= rp       else
+                                 "Adequate" if stock <= rp * 2   else "Good")
+                bulk += [{"index": {"_index": Config.INDEX_INVENTORY, "_id": inv_id}}, inv]
+        return bulk
+
+    def redeem_points(self, customer_id: str, points: int,
+                      item_name: str) -> Tuple[bool, str, Dict]:
+        customer = self.get_customer(customer_id)
+        if not customer:
+            return False, "Customer not found", {}
+        current = customer["loyalty_profile"]["total_points"]
+        if current < points:
+            return False, f"Insufficient points. Have {current}, need {points}", {}
+        customer["loyalty_profile"]["total_points"]        = current - points
+        customer["loyalty_profile"]["points_redeemed_ytd"] += points
+        customer["loyalty_profile"]["last_activity"]        = datetime.now().isoformat()
+        customer.pop("ml", None)
+        ok = self.es_client.update_document(Config.INDEX_CUSTOMERS, customer_id, customer)
+        if ok:
+            return True, f"Redeemed {points} points for {item_name}", \
+                   {"new_balance": current - points}
+        return False, "Failed to update points", {}
+
     def create_bulk_transactions(self, transaction_requests: List[Dict]) -> Dict:
-        """Create multiple transactions efficiently using bulk operations"""
         if not transaction_requests:
             return {"success": False, "error": "No transactions to process"}
-        
-        start_time = datetime.now()
-        
-        # Prepare all transaction data
-        all_transactions = []
-        all_customers = {}
-        all_inventory_updates = []
-        total_revenue = 0
-        
-        logger.info(f"Processing {len(transaction_requests)} bulk transactions...")
-        
-        try:
-            # Fetch all customers in batch
-            customer_ids = list(set([req['customer_id'] for req in transaction_requests]))
-            customers_data = self._fetch_customers_batch(customer_ids)
-            
-            # Process each transaction request
-            for req in transaction_requests:
-                customer_id = req['customer_id']
-                items = req['items']
-                channel = req['channel']
-                store_info = req['store_info']
-                payment_method = req.get('payment_method', 'cash')
-                
-                customer = customers_data.get(customer_id)
-                if not customer:
-                    continue
-                
-                # Calculate order details
-                order_total = sum(item['price'] * item['quantity'] for item in items)
-                customer_tier = customer['loyalty_profile']['tier']
-                points_earned = self.calculate_points(order_total, channel, customer_tier)
-                
-                # Create transaction record
-                transaction_id = f"txn_{customer_id}_{str(uuid.uuid4())[:8]}"
-                transaction_data = {
-                    "transaction_id": transaction_id,
-                    "customer_id": customer_id,
-                    "store_id": store_info.get('store_id', 'store_001'),
-                    "timestamp": datetime.now().isoformat(),
-                    "channel": channel,
-                    "location": store_info,
-                    "items": items,
-                    "order_total": order_total,
-                    "points_earned": points_earned,
-                    "points_redeemed": 0,
-                    "payment_method": payment_method,
-                    "order_type": channel,
-                    "hour_of_day": datetime.now().hour,
-                    "day_of_week": datetime.now().strftime("%A"),
-                    "is_weekend": datetime.now().weekday() >= 5
-                }
-                
-                all_transactions.append((transaction_id, transaction_data))
-                total_revenue += order_total
-                
-                # Update customer data
-                current_annual = customer['loyalty_profile']['annual_spending']
-                new_annual = current_annual + order_total
-                new_tier = self.check_tier_upgrade(new_annual)
-                
-                customer['loyalty_profile']['total_points'] += points_earned
-                customer['loyalty_profile']['points_earned_ytd'] += points_earned
-                customer['loyalty_profile']['annual_spending'] = new_annual
-                customer['loyalty_profile']['tier'] = new_tier
-                customer['loyalty_profile']['last_activity'] = datetime.now().isoformat()
-                customer['purchase_behavior']['total_orders'] += 1
-                
-                # Remove ML field
-                if 'ml' in customer:
-                    del customer['ml']
-                
-                all_customers[customer_id] = customer
-                
-                # Prepare inventory updates
-                inventory_updates = self._prepare_inventory_updates(store_info.get('store_id', 'store_001'), items)
-                all_inventory_updates.extend(inventory_updates)
-            
-            # Execute all updates in one bulk operation
-            bulk_updates = []
-            
-            # Add transactions
-            for transaction_id, transaction_data in all_transactions:
-                bulk_updates.extend([
-                    {"index": {"_index": Config.INDEX_TRANSACTIONS, "_id": transaction_id}},
-                    transaction_data
-                ])
-            
-            # Add customers
-            for customer_id, customer_data in all_customers.items():
-                bulk_updates.extend([
-                    {"index": {"_index": Config.INDEX_CUSTOMERS, "_id": customer_id}},
-                    customer_data
-                ])
-            
-            # Add inventory updates
-            bulk_updates.extend(all_inventory_updates)
-            
-            # Execute bulk update
-            success = self._execute_bulk_update(bulk_updates)
-            
-            if success:
-                # Refresh indices once at the end
-                self.es_client.refresh_index([Config.INDEX_TRANSACTIONS, Config.INDEX_CUSTOMERS, Config.INDEX_INVENTORY])
-                
-                processing_time = (datetime.now() - start_time).total_seconds()
-                logger.info(f"Bulk processed {len(all_transactions)} transactions in {processing_time:.2f}s (₱{total_revenue})")
-                
-                return {
-                    "success": True,
-                    "transactions_created": len(all_transactions),
-                    "total_revenue": total_revenue,
-                    "processing_time_seconds": processing_time,
-                    "performance_note": f"Processed {len(all_transactions)} orders in {processing_time:.2f}s"
-                }
-            else:
-                return {"success": False, "error": "Bulk update failed"}
-                
-        except Exception as e:
-            logger.error(f"Bulk transaction creation failed: {str(e)}")
-            return {"success": False, "error": str(e)}
-    
-    def _fetch_customers_batch(self, customer_ids: List[str]) -> Dict:
-        """Fetch multiple customers in a single query"""
-        try:
-            query = {
-                "query": {"terms": {"_id": customer_ids}},
-                "size": len(customer_ids)
-            }
-            
-            response = self.es_client.aggregation_search(Config.INDEX_CUSTOMERS, query)
-            
-            customers = {}
-            if response and response.get('hits', {}).get('hits'):
-                for hit in response['hits']['hits']:
-                    customers[hit['_id']] = hit['_source']
-            
-            return customers
-            
-        except Exception as e:
-            logger.error(f"Error fetching customers batch: {str(e)}")
-            return {}
-    
-    # Menu Search (unchanged)
-    def search_menu(self, query_text: str, limit: int = 10) -> List[Dict]:
-        """Semantic search through menu items"""
-        results = self.es_client.semantic_search(
-            Config.INDEX_MENU,
-            query_text,
-            size=limit,
-            source_fields=["name", "category", "price", "description", "nutritional_info", 
-                          "is_new", "is_bestseller", "points_value"]
-        )
-        
-        menu_items = []
-        for hit in results.get('hits', {}).get('hits', []):
-            item = hit['_source']
-            menu_items.append({
-                "name": item['name'],
-                "category": item['category'],
-                "price": item['price'],
-                "description": item['description'],
-                "nutritional_info": item.get('nutritional_info', {}),
-                "is_new": item.get('is_new', False),
-                "is_bestseller": item.get('is_bestseller', False),
-                "points_value": item.get('points_value', 0),
-                "relevance_score": hit['_score']
-            })
-        
-        logger.info(f"Menu search for '{query_text}' returned {len(menu_items)} results")
-        return menu_items
-    
-    # Analytics (unchanged for now, but could be optimized further)
-    def get_store_analytics(self) -> Dict:
-        """Get real-time store performance analytics"""
-        # Get all stores
-        stores_query = {"query": {"match_all": {}}, "size": 20}
-        stores_response = self.es_client.aggregation_search(Config.INDEX_STORES, stores_query)
-        
-        if not stores_response or not stores_response.get('hits', {}).get('hits'):
-            return {"success": False, "error": "No stores found"}
-        
-        stores = [hit['_source'] for hit in stores_response['hits']['hits']]
-        
-        # Get recent transaction aggregations (last 24 hours)
-        last_24h = (datetime.now() - timedelta(hours=24)).isoformat()
-        
-        agg_query = {
-            "query": {"range": {"timestamp": {"gte": last_24h}}},
-            "size": 0,
-            "aggs": {
-                "stores": {
-                    "terms": {"field": "store_id", "size": 20},
-                    "aggs": {
-                        "total_revenue": {"sum": {"field": "order_total"}},
-                        "order_count": {"value_count": {"field": "transaction_id"}},
-                        "avg_order": {"avg": {"field": "order_total"}},
-                        "channel_breakdown": {"terms": {"field": "channel"}}
-                    }
-                }
-            }
-        }
-        
-        agg_response = self.es_client.aggregation_search(Config.INDEX_TRANSACTIONS, agg_query)
-        
-        # Process results
-        store_performance = {}
-        if agg_response and agg_response.get('aggregations'):
-            for bucket in agg_response['aggregations']['stores']['buckets']:
-                store_id = bucket['key']
-                store_performance[store_id] = {
-                    "recent_orders": bucket['order_count']['value'],
-                    "recent_revenue": bucket['total_revenue']['value'],
-                    "avg_order_value": bucket['avg_order']['value'] if bucket['avg_order']['value'] else 0,
-                    "channels": {ch['key']: ch['doc_count'] for ch in bucket['channel_breakdown']['buckets']}
-                }
-        
-        # Combine store data with performance metrics
-        enhanced_stores = []
-        for store in stores:
-            store_id = store['store_id']
-            performance = store_performance.get(store_id, {
-                "recent_orders": 0,
-                "recent_revenue": 0,
-                "avg_order_value": 0,
-                "channels": {}
-            })
-            enhanced_stores.append({**store, **performance})
-        
-        logger.info(f"Retrieved analytics for {len(enhanced_stores)} stores")
-        return {
-            "success": True,
-            "stores": enhanced_stores,
-            "total_stores": len(enhanced_stores),
-            "last_updated": datetime.now().isoformat()
-        }
-    
-    def get_inventory_analytics(self, store_id: str) -> Dict:
-        """FIXED: Get real-time inventory analytics for a store"""
-        # FIXED: Updated query to properly search for inventory items
-        inventory_query = {
-            "query": {
-                "bool": {
-                    "must": [
-                        {"term": {"store_id": store_id}}
-                    ]
-                }
-            },
-            "size": 100,
-            "sort": [
-                {"timestamp": {"order": "desc"}}, 
-                {"status": {"order": "desc"}}, 
-                {"current_stock": {"order": "asc"}}
+        start    = datetime.now()
+        cids     = list({r["customer_id"] for r in transaction_requests})
+        custs    = self._fetch_customers_batch(cids)
+        all_bulk = []; total_revenue = 0
+
+        for req in transaction_requests:
+            cid = req["customer_id"]; c = custs.get(cid)
+            if not c: continue
+            items  = req["items"]; channel = req["channel"]
+            total  = sum(i["price"] * i["quantity"] for i in items)
+            pts    = self.calculate_points(total, channel, c["loyalty_profile"]["tier"])
+            tid    = f"txn_{cid}_{str(uuid.uuid4())[:8]}"
+            all_bulk += [
+                {"index": {"_index": Config.INDEX_TRANSACTIONS, "_id": tid}},
+                {"transaction_id": tid, "customer_id": cid,
+                 "store_id":  req["store_info"].get("store_id", "store_001"),
+                 "timestamp": datetime.now().isoformat(),
+                 "channel": channel, "location": req["store_info"],
+                 "items": items, "order_total": total,
+                 "points_earned": pts, "points_redeemed": 0,
+                 "payment_method": req.get("payment_method", "cash"),
+                 "order_type": channel,
+                 "hour_of_day": datetime.now().hour,
+                 "day_of_week": datetime.now().strftime("%A"),
+                 "is_weekend":  datetime.now().weekday() >= 5}
             ]
+            total_revenue += total
+            new_annual = c["loyalty_profile"]["annual_spending"] + total
+            c["loyalty_profile"]["total_points"]      += pts
+            c["loyalty_profile"]["points_earned_ytd"] += pts
+            c["loyalty_profile"]["annual_spending"]    = new_annual
+            c["loyalty_profile"]["tier"]               = self.check_tier_upgrade(new_annual)
+            c["loyalty_profile"]["last_activity"]      = datetime.now().isoformat()
+            c["purchase_behavior"]["total_orders"]     += 1
+            c.pop("ml", None); custs[cid] = c
+
+        for cid, cdata in custs.items():
+            all_bulk += [{"index": {"_index": Config.INDEX_CUSTOMERS, "_id": cid}}, cdata]
+
+        bulk_body = "\n".join(json.dumps(x) for x in all_bulk) + "\n"
+        resp = http_requests.post(
+            f"{self.es_client.endpoint}/_bulk",
+            headers={**self.es_client.headers, "Content-Type": "application/x-ndjson"},
+            data=bulk_body, timeout=30
+        )
+        if resp.status_code == 200:
+            self.es_client.refresh_index([Config.INDEX_TRANSACTIONS,
+                                          Config.INDEX_CUSTOMERS, Config.INDEX_INVENTORY])
+            n = len(transaction_requests)
+            t = (datetime.now() - start).total_seconds()
+            return {"success": True, "transactions_created": n,
+                    "total_revenue": total_revenue, "processing_time_seconds": t}
+        return {"success": False, "error": f"Bulk failed: {resp.status_code}"}
+
+    def _fetch_customers_batch(self, customer_ids: List[str]) -> Dict:
+        try:
+            q    = {"query": {"terms": {"_id": customer_ids}}, "size": len(customer_ids)}
+            resp = self.es_client.aggregation_search(Config.INDEX_CUSTOMERS, q)
+            return {h["_id"]: h["_source"]
+                    for h in resp.get("hits", {}).get("hits", [])}
+        except Exception as e:
+            logger.error(f"Batch customer fetch error: {e}")
+            return {}
+
+    def get_store_analytics(self) -> Dict:
+        sr = self.es_client.aggregation_search(
+            Config.INDEX_STORES, {"query": {"match_all": {}}, "size": 20})
+        if not sr or not sr.get("hits", {}).get("hits"):
+            return {"success": False, "error": "No stores found"}
+        stores   = [h["_source"] for h in sr["hits"]["hits"]]
+        last_24h = (datetime.now() - timedelta(hours=24)).isoformat()
+        agg_q    = {
+            "query": {"range": {"timestamp": {"gte": last_24h}}}, "size": 0,
+            "aggs": {"stores": {"terms": {"field": "store_id", "size": 20}, "aggs": {
+                "total_revenue":     {"sum":         {"field": "order_total"}},
+                "order_count":       {"value_count": {"field": "transaction_id"}},
+                "avg_order":         {"avg":         {"field": "order_total"}},
+                "channel_breakdown": {"terms":       {"field": "channel"}}
+            }}}
         }
-        
-        response = self.es_client.aggregation_search(Config.INDEX_INVENTORY, inventory_query)
-        
-        if not response or not response.get('hits', {}).get('hits'):
-            logger.warning(f"No inventory data found for store {store_id}")
-            
-            # Try to get inventory from any store to debug
-            debug_query = {"query": {"match_all": {}}, "size": 10}
-            debug_response = self.es_client.aggregation_search(Config.INDEX_INVENTORY, debug_query)
-            
-            if debug_response and debug_response.get('hits', {}).get('hits'):
-                logger.info(f"Found {len(debug_response['hits']['hits'])} total inventory items in system")
-                sample_stores = set()
-                for hit in debug_response['hits']['hits']:
-                    sample_stores.add(hit['_source'].get('store_id', 'unknown'))
-                logger.info(f"Sample store IDs in inventory: {list(sample_stores)}")
-            
-            return {"success": False, "error": f"No inventory data found for store {store_id}"}
-        
-        items = [hit['_source'] for hit in response['hits']['hits']]
-        
-        # Calculate insights
-        total_items = len(items)
-        critical_items = [item for item in items if item['status'] == 'Critical']
-        low_items = [item for item in items if item['status'] == 'Low']
-        
-        # Generate recommendations
-        recommendations = []
-        for item in critical_items + low_items:
-            urgency = "CRITICAL: Immediate reorder required!" if item['status'] == 'Critical' else "WARNING: Schedule reorder soon"
-            recommendations.append({
-                "item": item['item_name'],
-                "action": urgency,
-                "current_stock": item['current_stock'],
-                "reorder_point": item['reorder_point'],
-                "predicted_stockout": item.get('predicted_stockout_date', ''),
-                "priority": "high" if item['status'] == 'Critical' else "medium"
-            })
-        
-        logger.info(f"Retrieved inventory analytics for store {store_id}: {total_items} items, {len(critical_items)} critical")
-        
+        ar   = self.es_client.aggregation_search(Config.INDEX_TRANSACTIONS, agg_q)
+        perf = {}
+        if ar and ar.get("aggregations"):
+            for b in ar["aggregations"]["stores"]["buckets"]:
+                perf[b["key"]] = {
+                    "recent_orders":   b["order_count"]["value"],
+                    "recent_revenue":  b["total_revenue"]["value"],
+                    "avg_order_value": b["avg_order"]["value"] or 0,
+                    "channels": {c["key"]: c["doc_count"]
+                                 for c in b["channel_breakdown"]["buckets"]}
+                }
+        enhanced = [{**s, **perf.get(s["store_id"], {
+            "recent_orders": 0, "recent_revenue": 0,
+            "avg_order_value": 0, "channels": {}
+        })} for s in stores]
+        return {"success": True, "stores": enhanced,
+                "total_stores": len(enhanced),
+                "last_updated": datetime.now().isoformat()}
+
+    def get_inventory_analytics(self, store_id: str) -> Dict:
+        q = {"query": {"bool": {"must": [{"term": {"store_id": store_id}}]}},
+             "size": 100, "sort": [{"current_stock": {"order": "asc"}}]}
+        resp = self.es_client.aggregation_search(Config.INDEX_INVENTORY, q)
+        if not resp or not resp.get("hits", {}).get("hits"):
+            return {"success": False, "error": f"No inventory for {store_id}"}
+        items    = [h["_source"] for h in resp["hits"]["hits"]]
+        critical = [i for i in items if i["status"] == "Critical"]
+        low      = [i for i in items if i["status"] == "Low"]
         return {
-            "success": True,
-            "store_id": store_id,
+            "success": True, "store_id": store_id,
             "inventory_summary": {
-                "total_items": total_items,
-                "critical_items": len(critical_items),
-                "low_items": len(low_items),
-                "adequate_items": len([item for item in items if item['status'] in ['Adequate', 'Good']])
+                "total_items":    len(items), "critical_items": len(critical),
+                "low_items":      len(low),
+                "adequate_items": len([i for i in items
+                                       if i["status"] in ["Adequate", "Good"]])
             },
             "inventory_items": items,
-            "recommendations": recommendations,
+            "recommendations": [
+                {"item": i["item_name"],
+                 "action": "CRITICAL: Immediate reorder!"
+                           if i["status"] == "Critical" else "WARNING: Schedule reorder",
+                 "current_stock": i["current_stock"],
+                 "reorder_point": i["reorder_point"],
+                 "priority": "high" if i["status"] == "Critical" else "medium"}
+                for i in critical + low
+            ],
             "last_updated": datetime.now().isoformat()
         }

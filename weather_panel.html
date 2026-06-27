@@ -1,0 +1,376 @@
+<!--
+  weather_panel.html
+  ====================
+  Drop this block into your existing DASHBOARD_HTML template
+  right after the "🔍 ELSER Semantic Menu Search" section.
+
+  Requires:
+    GET  /api/stores/locations   → [{store_id, store_name, lat, lon}]
+    GET  /api/customers/<id>/recommendations/weather?lat=&lon=
+  Both routes are in app_weather_routes.py (included separately).
+
+  Self-contained: no external dependencies beyond what the dashboard already loads.
+-->
+
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<!-- 🌤  WEATHER-BASED RECOMMENDATIONS                                     -->
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<div class="section" id="weather-section">
+  <h2>🌤️ Weather-Based Recommendations</h2>
+  <p class="section-desc">
+    Recommendations adjust to real-time weather at the store where the order happens.
+    Select a store location and a customer to see what ES + Claude suggest right now.
+  </p>
+
+  <div class="weather-controls">
+
+    <!-- Store / location picker -->
+    <div class="weather-field">
+      <label for="weather-store-select">Store location</label>
+      <select id="weather-store-select">
+        <option value="">Loading stores…</option>
+      </select>
+    </div>
+
+    <!-- Customer picker -->
+    <div class="weather-field">
+      <label for="weather-customer-input">Customer ID</label>
+      <input id="weather-customer-input" type="text"
+             placeholder="mike001, zander001, melvin001…" />
+    </div>
+
+    <button id="weather-btn" onclick="fetchWeatherRecs()">
+      🌤️ Get Recommendations
+    </button>
+  </div>
+
+  <!-- Live weather badge — shown after first fetch -->
+  <div id="weather-badge" class="weather-badge hidden"></div>
+
+  <!-- Result grid -->
+  <div id="weather-results" class="weather-grid hidden"></div>
+
+  <!-- Nearest store pill -->
+  <div id="weather-store-pill" class="weather-store-pill hidden"></div>
+</div>
+
+<style>
+/* ── Section wrapper ──────────────────────────────────────────────────── */
+#weather-section {
+  background: #fff;
+  border: 1px solid #e8e4d9;
+  border-radius: 12px;
+  padding: 24px 28px;
+  margin: 20px 0;
+}
+#weather-section h2 {
+  font-size: 18px;
+  font-weight: 600;
+  color: #1a1a1a;
+  margin: 0 0 6px;
+}
+.section-desc {
+  font-size: 13px;
+  color: #666;
+  margin: 0 0 20px;
+}
+
+/* ── Controls row ─────────────────────────────────────────────────────── */
+.weather-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.weather-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1;
+  min-width: 180px;
+}
+.weather-field label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #444;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.weather-field select,
+.weather-field input {
+  height: 40px;
+  padding: 0 12px;
+  border: 1.5px solid #ddd;
+  border-radius: 8px;
+  font-size: 14px;
+  color: #222;
+  background: #fafafa;
+  outline: none;
+  transition: border-color .15s;
+}
+.weather-field select:focus,
+.weather-field input:focus {
+  border-color: #e2001a;
+  background: #fff;
+}
+#weather-btn {
+  height: 40px;
+  padding: 0 22px;
+  background: #e2001a;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .15s;
+  flex-shrink: 0;
+}
+#weather-btn:hover  { background: #c0001a; }
+#weather-btn:active { background: #a0001a; }
+#weather-btn:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+}
+
+/* ── Weather badge ────────────────────────────────────────────────────── */
+.weather-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  background: linear-gradient(135deg, #fff8e1, #fff3cd);
+  border: 1px solid #f0c040;
+  border-radius: 10px;
+  padding: 10px 16px;
+  margin-bottom: 18px;
+  font-size: 13px;
+  color: #5a4000;
+}
+.weather-badge .temp  { font-size: 22px; font-weight: 700; color: #b35c00; }
+.weather-badge .cond  { font-size: 13px; color: #7a5500; }
+.weather-badge .reason { font-size: 12px; color: #8a6800; font-style: italic; }
+.weather-badge .source-pill {
+  font-size: 10px;
+  background: #ffe082;
+  border-radius: 4px;
+  padding: 2px 6px;
+  color: #5a4000;
+  font-weight: 600;
+}
+
+/* ── Recommendation grid ──────────────────────────────────────────────── */
+.weather-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.weather-card {
+  border: 1.5px solid #eee;
+  border-radius: 10px;
+  padding: 14px 16px;
+  background: #fafafa;
+  transition: box-shadow .15s, transform .15s;
+  position: relative;
+}
+.weather-card:hover {
+  box-shadow: 0 4px 14px rgba(0,0,0,.08);
+  transform: translateY(-2px);
+}
+.weather-card .card-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1a1a1a;
+  margin-bottom: 4px;
+  line-height: 1.3;
+}
+.weather-card .card-cat {
+  font-size: 11px;
+  color: #888;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+.weather-card .card-price {
+  font-size: 16px;
+  font-weight: 700;
+  color: #e2001a;
+}
+.weather-card .card-pts {
+  font-size: 11px;
+  color: #888;
+  margin-top: 2px;
+}
+.card-badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.badge-new        { background: #e3f2fd; color: #1565c0; }
+.badge-bestseller { background: #fce4ec; color: #c62828; }
+
+/* ── Nearest store pill ───────────────────────────────────────────────── */
+.weather-store-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #f1f8e9;
+  border: 1px solid #aed581;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 12px;
+  color: #33691e;
+}
+.weather-store-pill strong { font-weight: 700; }
+
+/* ── Utility ──────────────────────────────────────────────────────────── */
+.hidden { display: none !important; }
+.weather-error {
+  background: #fff3f3;
+  border: 1px solid #f5c6cb;
+  border-radius: 8px;
+  padding: 12px 16px;
+  color: #721c24;
+  font-size: 13px;
+}
+</style>
+
+<script>
+/* ── Store locations cache ─────────────────────────────────────────────── */
+const STORE_LOCATIONS = {};   // store_id → {name, lat, lon}
+
+/* ── Known Jollibee store coordinates (fallback if /api/stores/locations
+      doesn't exist yet — matches the stores in the demo data)           ── */
+const FALLBACK_STORES = [
+  { store_id: "store_001", store_name: "SM North EDSA",      lat: 14.6565, lon: 121.0322 },
+  { store_id: "store_002", store_name: "BGC Central Square",  lat: 14.5501, lon: 121.0479 },
+  { store_id: "store_003", store_name: "Makati Ayala",        lat: 14.5547, lon: 121.0244 },
+  { store_id: "store_004", store_name: "UP Town Center",      lat: 14.6536, lon: 121.0502 },
+  { store_id: "store_005", store_name: "MOA Complex",         lat: 14.5353, lon: 120.9822 },
+];
+
+/* ── Condition → emoji ────────────────────────────────────────────────── */
+function condEmoji(cond) {
+  const map = { sunny: "☀️", "partly cloudy": "⛅", rainy: "🌧️",
+                stormy: "⛈️", cold: "🌥️", cloudy: "☁️" };
+  return map[cond] || "🌡️";
+}
+
+/* ── Populate the store dropdown ──────────────────────────────────────── */
+async function populateStoreDropdown() {
+  const sel = document.getElementById("weather-store-select");
+  let stores = FALLBACK_STORES;
+
+  try {
+    const resp = await fetch("/api/stores/locations");
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.stores && data.stores.length) stores = data.stores;
+    }
+  } catch (_) { /* use fallback */ }
+
+  sel.innerHTML = '<option value="">— choose a store —</option>';
+  stores.forEach(s => {
+    STORE_LOCATIONS[s.store_id] = s;
+    const opt = document.createElement("option");
+    opt.value = s.store_id;
+    opt.textContent = s.store_name;
+    sel.appendChild(opt);
+  });
+}
+
+/* ── Main fetch ───────────────────────────────────────────────────────── */
+async function fetchWeatherRecs() {
+  const storeId    = document.getElementById("weather-store-select").value;
+  const customerId = document.getElementById("weather-customer-input").value.trim();
+  const btn        = document.getElementById("weather-btn");
+
+  if (!storeId)    { alert("Please select a store location."); return; }
+  if (!customerId) { alert("Please enter a Customer ID."); return; }
+
+  const store = STORE_LOCATIONS[storeId];
+  if (!store)  { alert("Store coordinates not found."); return; }
+
+  btn.disabled    = true;
+  btn.textContent = "⏳ Fetching…";
+
+  const badge     = document.getElementById("weather-badge");
+  const grid      = document.getElementById("weather-results");
+  const storePill = document.getElementById("weather-store-pill");
+  badge.classList.add("hidden");
+  grid.classList.add("hidden");
+  storePill.classList.add("hidden");
+
+  try {
+    const url  = `/api/customers/${customerId}/recommendations/weather`
+                 + `?lat=${store.lat}&lon=${store.lon}`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    if (!resp.ok || !data.success) {
+      grid.innerHTML = `<div class="weather-error">
+        ❌ ${data.error || "Could not load weather recommendations."}</div>`;
+      grid.classList.remove("hidden");
+      return;
+    }
+
+    /* ── Weather badge ──────────────────────────────────────────────── */
+    const w    = data.weather || {};
+    const src  = w.source === "default" ? "📍 default (Metro Manila)" : "🛰️ live";
+    badge.innerHTML = `
+      <span class="temp">${w.temperature_c ?? "?"}°C</span>
+      <span>
+        <div class="cond">${condEmoji(w.condition)} ${w.condition ?? ""}</div>
+        <div class="reason">${data.reason ?? ""}</div>
+      </span>
+      <span class="source-pill">${src}</span>`;
+    badge.classList.remove("hidden");
+
+    /* ── Recommendation cards ───────────────────────────────────────── */
+    const recs = data.recommendations || [];
+    if (recs.length === 0) {
+      grid.innerHTML = '<p style="color:#888;font-size:13px">No recommendations found.</p>';
+    } else {
+      grid.innerHTML = recs.map(r => {
+        const badgeHtml = r.is_new        ? '<span class="card-badge badge-new">NEW</span>'
+                        : r.is_bestseller ? '<span class="card-badge badge-bestseller">★ Best</span>'
+                        : "";
+        return `
+          <div class="weather-card">
+            ${badgeHtml}
+            <div class="card-name">${r.name}</div>
+            <div class="card-cat">${r.category}</div>
+            <div class="card-price">₱${r.price}</div>
+            <div class="card-pts">+${r.points_value} pts</div>
+          </div>`;
+      }).join("");
+    }
+    grid.classList.remove("hidden");
+
+    /* ── Nearest store pill ─────────────────────────────────────────── */
+    if (data.nearest_store) {
+      const ns = data.nearest_store;
+      storePill.innerHTML = `
+        📍 Nearest store: <strong>${ns.store_name || ns.store_id}</strong>
+        ${ns.distance_km != null ? `· ${ns.distance_km} km away` : ""}`;
+      storePill.classList.remove("hidden");
+    }
+
+  } catch (err) {
+    grid.innerHTML = `<div class="weather-error">❌ Network error: ${err.message}</div>`;
+    grid.classList.remove("hidden");
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = "🌤️ Get Recommendations";
+  }
+}
+
+/* ── Init ─────────────────────────────────────────────────────────────── */
+document.addEventListener("DOMContentLoaded", populateStoreDropdown);
+</script>
